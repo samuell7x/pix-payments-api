@@ -1,79 +1,101 @@
 # pix-payments-api
 
-Simulador de PSP (Provedor de Serviço de Pagamento) com PIX, focado em demonstrar
-domínio dos problemas reais de engenharia que um sistema de transferência instantânea
-exige: **controle de concorrência**, **idempotência** e **consistência transacional**.
+Simulador de um PSP (provedor de serviço de pagamento) com PIX. Fiz este projeto para
+praticar os problemas que aparecem quando duas transferências mexem na mesma conta ao
+mesmo tempo: concorrência, idempotência e consistência no banco.
 
-> ⚠️ Este NÃO é uma integração com o SPI/Bacen. É um simulador de portfólio, com um
-> "DICT" (registro de chaves) e uma "liquidação" (transferência entre contas) próprios.
+Não é uma integração com o SPI do Bacen. O registro de chaves e a liquidação entre
+contas são implementações próprias, só para estudo.
+
+## O que tem
+
+- Contas com saldo
+- Chaves PIX (CPF, CNPJ, e-mail, telefone e chave aleatória), com limite de 5 por conta
+- Consulta de chave que devolve só o nome mascarado do titular
+- Transferência entre contas com `Idempotency-Key`
+- Extrato paginado, com filtro por direção (enviados/recebidos) e período
+- Front-end em React para usar tudo isso pelo navegador
 
 ## Stack
 
-- Java 25 + Spring Boot 3.5.16
-- PostgreSQL 16 + Flyway
-- Spring Data JPA (lock pessimista para concorrência)
-- springdoc-openapi (Swagger UI)
-- JUnit 5 + Mockito (unitários) + Testcontainers (integração/concorrência)
-- Docker + Docker Compose
+- Java 25 e Spring Boot 3.5.16
+- PostgreSQL 16 com Flyway
+- Spring Data JPA
+- springdoc-openapi (Swagger)
+- JUnit 5, Mockito e Testcontainers
+- React, TypeScript e Vite (pasta `frontend/`)
+- Docker e Docker Compose
 
-## Arquitetura
+## Como a transferência funciona
 
-```
-controller  → validação de entrada (Bean Validation), mapeamento HTTP
-service     → regra de negócio, transação, locking pessimista, idempotência
-repository  → Spring Data JPA + Specifications
-PostgreSQL  → Flyway migrations
-```
+O código fica em `PixTransferService`. Os três pontos que mais deram trabalho:
 
-### Decisões de design relevantes
+**Concorrência.** O débito e o crédito rodam numa transação só, e as duas contas são
+travadas com `SELECT ... FOR UPDATE`. O lock é sempre adquirido na mesma ordem (pelo
+UUID da conta). Sem isso, uma transferência A→B e outra B→A ao mesmo tempo podem se
+travar uma na outra.
 
-| Problema | Solução | Onde |
-|---|---|---|
-| Lost update entre débito e crédito | `SELECT ... FOR UPDATE` nas duas contas, **sempre na mesma ordem de UUID** (evita deadlock entre transferências opostas A→B e B→A simultâneas) | `PixTransferService`, `AccountRepository.findByIdForUpdate` |
-| Retry de rede duplicando pagamento | `UNIQUE` constraint em `idempotency_key`; ao colidir, retorna a transação já processada em vez de reprocessar | `PixTransferService.persistIdempotently` |
-| Saldo insuficiente não é bug | É um resultado de negócio válido: a transação é **persistida como `FAILED`** com motivo, não vira exceção 500 | `PixTransferService.transfer` |
-| Consulta de chave não pode vazar saldo | Endpoint de lookup retorna só nome do titular mascarado | `PixKeyLookupResponse` |
-| Extrato com muitos filtros | `Specification` composable em vez de if-chain gigante | `PixTransactionSpecifications` |
+**Idempotência.** A chave `Idempotency-Key` tem uma constraint `UNIQUE` no banco. Se o
+cliente reenviar a mesma requisição, a colisão é tratada e a API devolve a transação
+que já tinha sido processada, sem debitar de novo. Deixei a garantia no banco, e não só
+na aplicação, porque duas requisições iguais podem chegar juntas.
 
-## Simplificações assumidas (fora de escopo deste portfólio)
+**Saldo insuficiente.** Não é erro do servidor. A transação é gravada com status
+`FAILED` e o motivo, e a resposta explica o que houve.
 
-- **Sem autenticação/autorização.** Qualquer `accountId` pode ser usado como origem.
-  Numa evolução real, entraria Spring Security + JWT, e `sourceAccountId` viria do
-  contexto autenticado, nunca do corpo da requisição.
-- **Validação de CPF/CNPJ é apenas de formato** (quantidade de dígitos), sem o
-  dígito verificador (mod 11) do documento real.
-- **Sem webhook/callback assíncrono** de notificação — pode ser adicionado depois
-  como endpoint de callback configurável por conta.
-- **Sem devolução/estorno de PIX** — evolução natural do MVP.
+O extrato usa `Specification` para combinar os filtros, em vez de uma sequência de
+`if`.
 
 ## Como rodar
 
-### 1. Configurar variáveis de ambiente
+### Pré-requisitos
+
+- JDK 25
+- Docker
+- Node 20 ou superior (só para o front-end)
+
+### 1. Variáveis de ambiente
 
 ```powershell
 copy .env.example .env
 ```
 
-Edite o `.env` e defina uma senha (não use a senha de exemplo).
+O `.env.example` já funciona para uso local. Se trocar a senha, troque nos dois campos
+(`POSTGRES_PASSWORD` e `SPRING_DATASOURCE_PASSWORD`) e use o mesmo valor.
 
-### 2. Subir com Docker Compose
+### 2. Tudo no Docker
 
 ```powershell
 docker compose up --build
 ```
 
-A API sobe em `http://localhost:8080`. Documentação interativa em
-`http://localhost:8080/docs`.
+A API sobe em `http://localhost:8080` e o Swagger em `http://localhost:8080/docs`.
 
-### 3. Rodar localmente sem Docker (opcional)
+### 3. API pela IDE, banco no Docker
 
 ```powershell
+docker compose up -d db
 .\mvnw spring-boot:run
 ```
 
-> A primeira execução do `mvnw` baixa o Maven Wrapper e o Maven automaticamente —
-> precisa de internet nesse primeiro passo. Requer JDK 25 e um PostgreSQL local
-> (ou suba só o banco com `docker compose up db`).
+Por padrão a aplicação conecta em `localhost:5432`. Se essa porta estiver ocupada,
+mude o mapeamento do serviço `db` no `docker-compose.yml` e informe a nova URL em
+`SPRING_DATASOURCE_URL`, por exemplo `jdbc:postgresql://localhost:5433/pixdb`.
+
+O `mvnw` baixa o Maven na primeira execução, então precisa de internet.
+
+### 4. Front-end
+
+Com a API no ar:
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+Abra `http://localhost:5173`. Em desenvolvimento, o Vite encaminha `/api` para
+`localhost:8080`, então não precisa de configuração de CORS.
 
 ## Testes
 
@@ -81,17 +103,21 @@ A API sobe em `http://localhost:8080`. Documentação interativa em
 .\mvnw test
 ```
 
-- **Unitários** (`PixTransferServiceTest`, `PixKeyServiceTest`): regras de negócio
-  isoladas com Mockito — saldo insuficiente, chave inexistente, auto-transferência,
-  replay idempotente, limite de chaves por conta.
-- **Integração** (`PixTransferConcurrencyIT`): sobe um PostgreSQL real via
-  Testcontainers e dispara **50 transferências concorrentes** (virtual threads) da
-  mesma conta de origem para a mesma conta de destino, validando que o saldo final
-  é matematicamente exato — prova de que o locking elimina lost updates.
+Os testes de integração usam Testcontainers, então o Docker precisa estar rodando.
 
-## Fluxo de uso (exemplos)
+- `PixTransferServiceTest` e `PixKeyServiceTest`: regras de negócio com Mockito (saldo
+  insuficiente, chave inexistente, transferência para a própria conta, reenvio
+  idempotente, limite de chaves).
+- `PixTransferConcurrencyIT`: sobe um PostgreSQL real e dispara 50 transferências
+  simultâneas, com virtual threads, da mesma origem para o mesmo destino. O teste
+  confere se o saldo final bate exatamente.
 
-### Criar duas contas
+## Exemplos de uso
+
+No PowerShell, use `curl.exe` em vez de `curl` (o `curl` do PowerShell é um alias de
+outro comando e não aceita esses parâmetros).
+
+Criar duas contas:
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/accounts \
@@ -103,7 +129,7 @@ curl -X POST http://localhost:8080/api/v1/accounts \
   -d '{"ownerName":"Bruno Souza","ownerDocument":"22222222222","initialBalance":0}'
 ```
 
-### Cadastrar uma chave PIX para o Bruno
+Cadastrar uma chave para o Bruno:
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/pix-keys \
@@ -111,7 +137,7 @@ curl -X POST http://localhost:8080/api/v1/pix-keys \
   -d '{"accountId":"<id-do-bruno>","keyType":"EMAIL","keyValue":"bruno@example.com"}'
 ```
 
-### Transferir da Alice para o Bruno
+Transferir da Alice para o Bruno:
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/pix/transfers \
@@ -120,16 +146,16 @@ curl -X POST http://localhost:8080/api/v1/pix/transfers \
   -d '{"sourceAccountId":"<id-da-alice>","targetPixKey":"bruno@example.com","amount":150.00,"description":"aluguel"}'
 ```
 
-Repetir a mesma requisição com o **mesmo** `Idempotency-Key` retorna a transação já
-processada, sem duplicar o débito.
+Repetir essa requisição com o mesmo `Idempotency-Key` devolve a mesma transação, sem
+debitar de novo.
 
-### Consultar extrato
+Consultar o extrato:
 
 ```bash
 curl "http://localhost:8080/api/v1/accounts/<id-da-alice>/statement?direction=OUT&page=0&size=10"
 ```
 
-## Padrão de erro
+## Formato dos erros
 
 ```json
 {
@@ -142,12 +168,16 @@ curl "http://localhost:8080/api/v1/accounts/<id-da-alice>/statement?direction=OU
 }
 ```
 
-Nenhum erro expõe stack trace, causa interna ou detalhes de infraestrutura ao cliente.
+A resposta não inclui stack trace nem detalhes internos.
 
-## Próximas evoluções sugeridas
+## O que ficou de fora
 
-1. Spring Security + JWT (remover `sourceAccountId` do corpo, extrair do contexto)
-2. Devolução/estorno de PIX dentro de janela de tempo
-3. Webhook HTTP configurável por conta para notificação assíncrona de status
-4. Rate limiting por conta/IP (proteção contra brute force de valores)
-5. Cálculo real do dígito verificador de CPF/CNPJ
+- **Autenticação.** Qualquer `accountId` pode ser usado como origem. Com autenticação,
+  a origem viria do usuário logado e não do corpo da requisição.
+- **Validação de CPF e CNPJ.** Só confere a quantidade de dígitos, sem o dígito
+  verificador.
+- **Estorno e webhooks.** Ficaram para uma próxima etapa.
+- **Rate limiting.**
+
+Como não tem autenticação nem limite de requisições, o projeto serve para estudo e
+demonstração. Não foi feito para ficar exposto na internet.
